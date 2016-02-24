@@ -12,6 +12,7 @@
 #include <linux/poll.h>
 #include <linux/proc_fs.h>	/* Necessary because we use proc fs */
 #include <linux/seq_file.h>	/* for seq_file */
+#include <linux/file.h>
 #include <asm/uaccess.h>	/* for get_user and put_user */
 
 #define SUCCESS 0
@@ -19,24 +20,22 @@
 
 
 #define CHRDEV      "parportsnif"
-#define CHRDEVLOG   "parportlog"
 #define VPP_MAJOR   367
-#define VLOG_MAJOR  368
 #define MAX_DEVICES 10
+#define MAX_LINES   10000
+#define PORT_NUM    0
 
 DECLARE_WAIT_QUEUE_HEAD(readwait);
 
 struct vpp_st {
     struct file *pfd;
     unsigned int port;
-    __user char *userbuf;
     int bufsz;
 };
 
 struct vlogline_st {
     struct vlogline_st *next;
     char *data;
-    int offset;
     int size;
 };
 
@@ -49,32 +48,35 @@ static struct class *vpp_class;
 
 static ssize_t log_write(const char *buffer, size_t length)
 {
-    struct vlogline_st  *line = vlog.lines, *newline;
+    struct vlogline_st  *line, *newline;
 
+	lock_kernel();
+    line = vlog.lines;
     while(line && line->next)
         line = line->next;
-    newline = (struct vlogline_st *)kmalloc(sizeof(struct vlogline_st), GFP_KERNEL);
-    if (!newline)
+    newline = (struct vlogline_st *)kzalloc(sizeof(struct vlogline_st), GFP_KERNEL);
+    if (!newline) {
+    	unlock_kernel();
         return -ENOMEM;
-    memset(newline, 0, sizeof(struct vlogline_st));
+    }
     newline->data = (char *)kmalloc(length, GFP_KERNEL);
     if (!newline->data) {
+    	unlock_kernel();
         kfree(newline);
         return -ENOMEM;
     }
-    newline->size = length;
     memcpy(newline->data, buffer, length);
-	lock_kernel();
     if(line)
         line->next = newline;
     else
         vlog.lines = newline;
     vlog.totlines++;
-    if (vlog.totlines > 500) {
+    while (vlog.totlines > MAX_LINES && vlog.lines) {
         line = vlog.lines;
         vlog.lines = line->next;
         kfree(line->data);
         kfree(line);
+        vlog.totlines--;
     }
 	unlock_kernel();
     return length;
@@ -90,16 +92,16 @@ static void vpp_log(struct vpp_st *vpp, const char *fmt, ...)
     memset(&ts, 0, sizeof(ts));
     getnstimeofday(&ts);
 
-    /* current time */
+    // current time
     sz = snprintf(buf, sizeof(buf), "[%u.%u] ", (unsigned int)ts.tv_sec, (unsigned int)ts.tv_nsec);
     
-    /* log message */
+    // log message
     va_start(args, fmt);
     sz += vsnprintf(buf+sz, sizeof(buf)-sz, fmt, args);
     va_end(args);
     buf[sz++] = '\n';
     buf[sz] = '\0';
-    log_write(buf, sz);
+    log_write(buf, sz+1);
 }
 
 /* 
@@ -109,26 +111,21 @@ static int device_open(struct inode *inode, struct file *file)
 {
     struct vpp_st *vpp = NULL;
     char port[64];
-    char log[64];
+    int err = 0;
 
 	vpp = kmalloc (sizeof(struct vpp_st), GFP_KERNEL);
 	if (!vpp) {
 		return -ENOMEM;
     }
     vpp->bufsz = 512;
-    vpp->userbuf = kmalloc(vpp->bufsz, GFP_USER);
-	if (!vpp->userbuf) {
-        kfree(vpp);
-		return -ENOMEM;
-    }
     vpp->port = iminor(inode);
     snprintf(port, sizeof(port)-1, "/dev/parport%d", vpp->port);
-    snprintf(log, sizeof(log)-1, "/tmp/parportsnif%d.log", vpp->port);
     /* open the real parallel port */
     vpp->pfd = filp_open(port, O_RDWR, 0);
-    if (!vpp->pfd) {
-		printk(KERN_ALERT "parportsnif: failed to open %s", port);
-        return -EBUSY;
+    if (IS_ERR(vpp->pfd)) {
+        err = PTR_ERR(vpp->pfd);
+	    printk(KERN_ALERT "parportsnif: failed to open %s", port);
+        return err;
     }
     file->private_data = vpp;
 	try_module_get(THIS_MODULE);
@@ -140,12 +137,12 @@ static int device_open(struct inode *inode, struct file *file)
 static int device_release(struct inode *inode, struct file *file)
 {
     struct vpp_st *vpp = (struct vpp_st *) file->private_data;
+
     if (vpp->pfd) {
-	    //filp_close(vpp->pfd, 0);
-        vpp->pfd->f_op->release(vpp->pfd->f_dentry->d_inode, vpp->pfd);
+	    filp_close(vpp->pfd, NULL);
     }
     vpp->pfd = NULL;
-	//module_put(THIS_MODULE);
+	module_put(THIS_MODULE);
     printk(KERN_INFO "parportsnif: successfully closed /dev/parport%d\n", vpp->port);
     vpp_log(vpp, "%d %s", vpp->port, "CLOSE");
     kfree(vpp);
@@ -170,11 +167,7 @@ unsigned int device_poll(struct file *file, struct poll_table_struct *ps)
  * This function is called whenever a process which has already opened the
  * device file attempts to read from it.
  */
-static ssize_t device_read(struct file *file,	/* see include/linux/fs.h   */
-			   char __user * buffer,	/* buffer to be
-							 * filled with data */
-			   size_t length,	/* length of the buffer     */
-			   loff_t * offset)
+static ssize_t device_read(struct file *file, char __user * buffer, size_t length, loff_t * offset)
 {
     struct vpp_st *vpp = (struct vpp_st *) file->private_data;
     int i;
@@ -230,7 +223,8 @@ device_write(struct file *file,
 	return(bytes_written);
 }
 
-#define CASE(a) case a: strcpy(buf, #a)
+#define LOGKFOP(el)     printk(KERN_INFO "vpp->pfd->f_op->%s = %p\n", #el, vpp->pfd->f_op->el)
+#define CASE(a) case a: snprintf(buf, sizeof(buf)-1, "%s", #a)
 /* 
  * This function is called whenever a process tries to do an ioctl on our
  * device file. We get two extra parameters (additional to the inode and file
@@ -248,7 +242,6 @@ long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 	unsigned char ch;
     char buf[64];
 
-    printk(KERN_INFO "parportsnif - %s\n", "new ioctl");
 	/* 
 	 * Switch according to the ioctl called 
 	 */
@@ -321,91 +314,6 @@ long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
 /* log file operations */
 
-/*
-static int log_open(struct inode *inode, struct file *file)
-{
-    struct vlog_st *vlog = NULL;
-    int minor = iminor(inode);
-
-    if (vlogs[minor] != NULL || minor > MAX_DEVICES)
-        return -EBUSY;
-    // allocate the structure
-	vlog = kmalloc (sizeof(struct vlog_st), GFP_KERNEL);
-	if (!vlog)
-		return -ENOMEM;
-    memset(vlog, 0, sizeof(struct vlog_st));
-    vlog->port = minor;
-    vlog->file = file;
-    file->private_data = vlog;
-    vlogs[minor] = vlog;
-	return SUCCESS;
-}
-
-static int log_release(struct inode *inode, struct file *file)
-{
-    struct vlog_st *vlog = (struct vlog_st *) file->private_data;
-    struct vlogline_st  *line = NULL;
-
-	lock_kernel();
-    line = vlog->lines;
-    while (vlog->lines) {
-        vlog->lines = line->next;
-        kfree(line->data);
-        kfree(line);
-    }
-    vlogs[vlog->port] = NULL;
-    kfree(vlog);
-	unlock_kernel();
-	return SUCCESS;
-}
-
-static ssize_t log_read(struct file *file,
-			   char __user * buffer, size_t length, loff_t * offset)
-{
-    struct vlog_st      *vlog = (struct vlog_st *) file->private_data;
-    struct vlogline_st  *line = NULL;
-    size_t              sz;
-
-    if (!buffer || length <= 0)
-        return -EINVAL;
-
-    if (!vlog->lines) {
-        if (file->f_flags & O_NONBLOCK) {
-            return -EAGAIN;
-        }
-        wait_event_interruptible(readwait, vlog->lines != NULL);
-    }
-	lock_kernel();
-    line = vlog->lines;
-    if (!line) {
-        unlock_kernel();
-        return 0;
-    }
-    sz = ((line->size-line->offset) > length) ? length : (line->size-line->offset);
-    copy_to_user(buffer, line->data+line->offset, sz);
-    line->offset += sz;
-    if (line->offset >= line->size) {
-        vlog->lines = line->next;
-        kfree(line->data);
-        kfree(line);
-    }
-	unlock_kernel();
-    return sz;
-}
-
-static unsigned int log_poll(struct file *file, poll_table * wait)
-{
-    struct vlog_st      *vlog = (struct vlog_st *) file->private_data;
-    unsigned int mask;
-
-    poll_wait(file, &readwait, wait);
-    mask = 0;
-    if (vlog->lines != NULL)
-        mask |= POLLIN | POLLRDNORM;
-    return mask;
-}
-*/
-
 /**
  * This function is called at the beginning of a sequence.
  * ie, when:
@@ -438,10 +346,7 @@ static void *log_seq_start(struct seq_file *s, loff_t *pos)
  */
 static void *log_seq_next(struct seq_file *s, void *v, loff_t *pos)
 {
-	unsigned long *tmp_v = (unsigned long *)v;
-	(*tmp_v)++;
-	(*pos)++;
-	return NULL;
+	return vlog.lines;
 }
 
 /**
@@ -460,7 +365,6 @@ static void log_seq_stop(struct seq_file *s, void *v)
 static int log_seq_show(struct seq_file *s, void *v)
 {
     struct vlogline_st  *line = NULL;
-    size_t              sz;
 
     if (!vlog.lines) {
     	return 0;
@@ -471,10 +375,11 @@ static int log_seq_show(struct seq_file *s, void *v)
         unlock_kernel();
         return 0;
     }
-    seq_printf(s, "%s", line);
+    seq_printf(s, "%s", line->data);
     vlog.lines = line->next;
     kfree(line->data);
     kfree(line);
+    vlog.totlines--;
 	unlock_kernel();
 	return 0;
 }
@@ -496,9 +401,9 @@ static struct seq_operations log_seq_ops = {
  */
 static int log_open(struct inode *inode, struct file *file)
 {
-    if ()
 	return seq_open(file, &log_seq_ops);
 };
+
 /* Module Declarations */
 
 /* 
@@ -525,21 +430,10 @@ struct file_operations vlog_fops = {
 	.read    = seq_read,
 	.llseek  = seq_lseek,
 	.release = seq_release
-/*
-    .owner = THIS_MODULE,
-	.read = log_read,
-	.write = log_write,
-    .poll = log_poll,
-	.open = log_open,
-	.release = log_release,
-*/
-
 };
 
 static void vpp_attach(struct parport *port)
 {
-    char buf[64];
-	struct proc_dir_entry *entry;
     struct device *device;
 	int err = 0;
 
@@ -553,33 +447,8 @@ static void vpp_attach(struct parport *port)
 
 static void vpp_detach(struct parport *port)
 {
-    char buf[64];
 	device_destroy(vpp_class, MKDEV(VPP_MAJOR, port->number));
-
-    snprintf(buf, sizeof(buf), "parportlog%d", port->number);
-    remove_proc_entry(buf, NULL);
-//	device_destroy(vlog_class, MKDEV(VLOG_MAJOR, port->number));
 }
-
-/*
-static void vlog_attach(struct parport *port)
-{
-    struct device *device;
-	int err = 0;
-
-	device = device_create(vlog_class, NULL, MKDEV(VLOG_MAJOR, port->number),
-		      NULL, "parportlog%d", port->number);
-    if (IS_ERR(device)) {
-        err = PTR_ERR(device);
-        printk(KERN_WARNING CHRDEVLOG "Error %d while trying to create %s%d", err, CHRDEVLOG, port->number);
-    }
-}
-
-static void vlog_detach(struct parport *port)
-{
-	device_destroy(vlog_class, MKDEV(VLOG_MAJOR, port->number));
-}
-*/
 
 static struct parport_driver vpp_driver = {
 	.name		= CHRDEV,
@@ -587,17 +456,10 @@ static struct parport_driver vpp_driver = {
 	.detach		= vpp_detach,
 };
 
-/*
-static struct parport_driver vlog_driver = {
-	.name		= CHRDEVLOG,
-	.attach		= vlog_attach,
-	.detach		= vlog_detach,
-};
-*/
-
 static int __init vpp_init (void)
 {
 	int err = 0;
+	struct proc_dir_entry *entry;
 
     memset(&vlog, 0, sizeof(vlog));
 
@@ -623,33 +485,8 @@ static int __init vpp_init (void)
 		entry->proc_fops = &vlog_fops;
 	}
 
-/*
-	if (register_chrdev (VLOG_MAJOR, CHRDEVLOG, &vlog_fops)) {
-		printk (KERN_WARNING CHRDEVLOG ": unable to get major %d\n",
-			VLOG_MAJOR);
-		err = -EIO;
-		goto out_chrdevlog;
-	}
-	vlog_class = class_create(THIS_MODULE, CHRDEVLOG);
-	if (IS_ERR(vlog_class)) {
-		printk (KERN_WARNING CHRDEVLOG ": error creating class parportlog\n");
-		err = PTR_ERR(vlog_class);
-		goto out_classlog;
-	}
-	if (parport_register_driver(&vlog_driver)) {
-		printk (KERN_WARNING CHRDEVLOG ": unable to register with parportlog\n");
-		goto out_registerlog;
-	}
-*/
 	goto out;
-/*
-out_registerlog:
-	class_destroy(vlog_class);
-out_classlog:
-    unregister_chrdev(VLOG_MAJOR, CHRDEVLOG);
-out_chrdevlog:
-	parport_unregister_driver(&vpp_driver);
-*/
+
 out_class:
 	class_destroy(vpp_class);
 out_chrdev:
@@ -661,11 +498,10 @@ out:
 static void __exit vpp_cleanup (void)
 {
 	/* Clean up all parport stuff */
+    remove_proc_entry("parportlog", NULL);
 	parport_unregister_driver(&vpp_driver);
 	class_destroy(vpp_class);
-//	class_destroy(vlog_class);
 	unregister_chrdev (VPP_MAJOR, CHRDEV);
-//	unregister_chrdev (VLOG_MAJOR, CHRDEV);
 }
 
 module_init(vpp_init);
@@ -673,5 +509,4 @@ module_exit(vpp_cleanup);
 
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_CHARDEV_MAJOR(VPP_MAJOR);
-MODULE_ALIAS_CHARDEV_MAJOR(VLOG_MAJOR);
 
