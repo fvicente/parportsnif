@@ -1,6 +1,25 @@
 /*
- *  Create an input/output character device
+ * Parallel port sniffer kernel module
+ *
+ * Copyright (c) 2012, Fernando Gabriel Vicente (www.alfersoft.com.ar - fvicente@gmail.com)
+ * All rights reserved.
+ * 
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Thanks to Rodrigo Zechin Rosauro!!!
  */
+
 #include <linux/kernel.h>	/* We're doing kernel work */
 #include <linux/module.h>	/* Specifically, a module */
 #include <linux/device.h>
@@ -25,18 +44,25 @@
 #define MAX_LINES   10000
 #define PORT_NUM    0
 
+#define SAMPLE_RATE     1000000
+#define SAMPLE_RATE_STR "1000000"
+
 DECLARE_WAIT_QUEUE_HEAD(readwait);
 
 struct vpp_st {
     struct file *pfd;
     unsigned int port;
     int bufsz;
+    struct timespec start;
+    unsigned char chanvalues[3];
+    unsigned char lastvalues[3];
 };
 
 struct vlogline_st {
     struct vlogline_st *next;
     char *data;
     int size;
+    int offset;
 };
 
 struct vlog_st {
@@ -59,12 +85,13 @@ static ssize_t log_write(const char *buffer, size_t length)
     	unlock_kernel();
         return -ENOMEM;
     }
-    newline->data = (char *)kmalloc(length, GFP_KERNEL);
+    newline->data = (char *)kzalloc(length+1, GFP_KERNEL);
     if (!newline->data) {
     	unlock_kernel();
         kfree(newline);
         return -ENOMEM;
     }
+    newline->size = length;
     memcpy(newline->data, buffer, length);
     if(line)
         line->next = newline;
@@ -79,7 +106,36 @@ static ssize_t log_write(const char *buffer, size_t length)
         vlog.totlines--;
     }
 	unlock_kernel();
+    wake_up_interruptible(&readwait);
     return length;
+}
+
+static void vpp_log_ols(struct vpp_st *vpp)
+{
+    char buf[900];
+    int sz;
+    struct timespec ts;
+    long long udelta;
+    uint32_t samplenum;
+
+    if (memcmp(vpp->lastvalues, vpp->chanvalues, sizeof(vpp->lastvalues)) == 0) {
+        // values did not change - nothing to do
+        return;
+    }
+
+    memset(&ts, 0, sizeof(ts));
+    getnstimeofday(&ts);
+    
+    // microseconds since "start"
+    udelta = ((ts.tv_sec - vpp->start.tv_sec) * (long long)1000000);
+    udelta += ((ts.tv_nsec - vpp->start.tv_nsec) / 1000);
+    // number of the sample
+    // /* todo - find a better way */ samplenum = do_div(udelta * 1000000, SAMPLE_RATE);
+    samplenum = udelta;
+    //0000000f@0
+    sz = snprintf(buf, sizeof(buf), "0000%.2X%.2X%.2X@%u\n", vpp->chanvalues[2], vpp->chanvalues[1], vpp->chanvalues[0], samplenum);
+    log_write(buf, sz);
+    memcpy(vpp->lastvalues, vpp->chanvalues, sizeof(vpp->lastvalues));
 }
 
 static void vpp_log(struct vpp_st *vpp, const char *fmt, ...)
@@ -93,7 +149,7 @@ static void vpp_log(struct vpp_st *vpp, const char *fmt, ...)
     getnstimeofday(&ts);
 
     // current time
-    sz = snprintf(buf, sizeof(buf), "[%u.%u] ", (unsigned int)ts.tv_sec, (unsigned int)ts.tv_nsec);
+    sz = snprintf(buf, sizeof(buf), "# [%u.%u] ", (unsigned int)ts.tv_sec, (unsigned int)ts.tv_nsec);
     
     // log message
     va_start(args, fmt);
@@ -101,7 +157,7 @@ static void vpp_log(struct vpp_st *vpp, const char *fmt, ...)
     va_end(args);
     buf[sz++] = '\n';
     buf[sz] = '\0';
-    log_write(buf, sz+1);
+    log_write(buf, sz);
 }
 
 /* 
@@ -113,7 +169,7 @@ static int device_open(struct inode *inode, struct file *file)
     char port[64];
     int err = 0;
 
-	vpp = kmalloc (sizeof(struct vpp_st), GFP_KERNEL);
+	vpp = kzalloc (sizeof(struct vpp_st), GFP_KERNEL);
 	if (!vpp) {
 		return -ENOMEM;
     }
@@ -128,9 +184,17 @@ static int device_open(struct inode *inode, struct file *file)
         return err;
     }
     file->private_data = vpp;
+    /* write the OLS log header */
+    log_write(";Rate: "SAMPLE_RATE_STR"\n", strlen(";Rate: "SAMPLE_RATE_STR"\n"));
+    log_write(";Channels: 32\n", strlen(";Channels: 32\n"));
+    /* get the starting timestamp */
+    memset(&vpp->start, 0, sizeof(vpp->start));
+    getnstimeofday(&vpp->start);
+    /* log the initial reading */
+    vpp_log_ols(vpp);
 	try_module_get(THIS_MODULE);
     printk(KERN_INFO "parportsnif: successfully opened %s\n", port);
-    vpp_log(vpp, "%d %s", vpp->port, "OPEN");
+    //vpp_log(vpp, "%d %s", vpp->port, "OPEN");
 	return SUCCESS;
 }
 
@@ -241,6 +305,7 @@ long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 	int has_data=0;
 	unsigned char ch;
     char buf[64];
+    long ret;
 
 	/* 
 	 * Switch according to the ioctl called 
@@ -253,6 +318,9 @@ long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     CASE(PPRCONTROL);
         break;
     CASE(PPWCONTROL);
+        get_user(ch, (char *)arg);
+        has_data = 1;
+        vpp->chanvalues[2] = ch;
         break;
     CASE(PPFCONTROL);
         break;
@@ -261,6 +329,7 @@ long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     CASE(PPWDATA);
         get_user(ch, (char *)arg);
         has_data = 1;
+        vpp->chanvalues[0] = ch;
         break;
     CASE(PPCLAIM);
         break;
@@ -304,96 +373,24 @@ long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         snprintf(buf, sizeof(buf)-1, "UNKNOWN %u", cmd);
         break;
     }
-    if(has_data) {
-        vpp_log(vpp, "%d IOCTL %s %.2X", vpp->port, buf, (unsigned int)ch);
-    } else {
-        vpp_log(vpp, "%d IOCTL %s", vpp->port, buf);
+    ret = vpp->pfd->f_op->unlocked_ioctl(vpp->pfd, cmd, arg);
+    if(cmd == PPRSTATUS) {
+        get_user(ch, (char *)arg);
+        has_data = 1;
+        vpp->chanvalues[1] = ch;
     }
-    return(vpp->pfd->f_op->unlocked_ioctl(vpp->pfd, cmd, arg));
+    if(has_data) {
+        vpp_log_ols(vpp);
+    }
+    //if(has_data) {
+    //    vpp_log(vpp, "%d IOCTL %s %.2X", vpp->port, buf, (unsigned int)ch);
+    //} else {
+    //    vpp_log(vpp, "%d IOCTL %s", vpp->port, buf);
+    //}
+    return(ret);
 }
 
 /* log file operations */
-
-/**
- * This function is called at the beginning of a sequence.
- * ie, when:
- *	- the /proc file is read (first time)
- *	- after the function stop (end of sequence)
- *
- */
-static void *log_seq_start(struct seq_file *s, loff_t *pos)
-{
-	static unsigned long counter = 0;
-
-	/* beginning a new sequence ? */	
-	if ( *pos == 0 )
-	{	
-		/* yes => return a non null value to begin the sequence */
-		return &counter;
-	}
-	else
-	{
-		/* no => it's the end of the sequence, return end to stop reading */
-		*pos = 0;
-		return NULL;
-	}
-}
-
-/**
- * This function is called after the beginning of a sequence.
- * It's called untill the return is NULL (this ends the sequence).
- *
- */
-static void *log_seq_next(struct seq_file *s, void *v, loff_t *pos)
-{
-	return vlog.lines;
-}
-
-/**
- * This function is called at the end of a sequence
- * 
- */
-static void log_seq_stop(struct seq_file *s, void *v)
-{
-	/* nothing to do, we use a static value in start() */
-}
-
-/**
- * This function is called for each "step" of a sequence
- *
- */
-static int log_seq_show(struct seq_file *s, void *v)
-{
-    struct vlogline_st  *line = NULL;
-
-    if (!vlog.lines) {
-    	return 0;
-    }
-	lock_kernel();
-    line = vlog.lines;
-    if (!line) {
-        unlock_kernel();
-        return 0;
-    }
-    seq_printf(s, "%s", line->data);
-    vlog.lines = line->next;
-    kfree(line->data);
-    kfree(line);
-    vlog.totlines--;
-	unlock_kernel();
-	return 0;
-}
-
-/**
- * This structure gather "function" to manage the sequence
- *
- */
-static struct seq_operations log_seq_ops = {
-	.start = log_seq_start,
-	.next  = log_seq_next,
-	.stop  = log_seq_stop,
-	.show  = log_seq_show
-};
 
 /**
  * This function is called when the /proc file is open.
@@ -401,8 +398,60 @@ static struct seq_operations log_seq_ops = {
  */
 static int log_open(struct inode *inode, struct file *file)
 {
-	return seq_open(file, &log_seq_ops);
-};
+	return SUCCESS;
+}
+
+static int log_release(struct inode *inode, struct file *file)
+{
+	return SUCCESS;
+}
+
+static ssize_t log_read(struct file *file,
+			   char __user * buffer, size_t length, loff_t * offset)
+{
+    struct vlogline_st  *line = NULL;
+    size_t              sz;
+
+    if (!buffer || length <= 0)
+        return -EINVAL;
+
+    if (!vlog.lines) {
+        if (file->f_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+        wait_event_interruptible(readwait, vlog.lines != NULL);
+    }
+	lock_kernel();
+    line = vlog.lines;
+    if (!line) {
+        unlock_kernel();
+        return 0;
+    }
+    sz = ((line->size-line->offset) > length) ? length : (line->size-line->offset);
+    copy_to_user(buffer, line->data+line->offset, sz);
+    line->offset += sz;
+    if (line->offset >= line->size) {
+        vlog.lines = line->next;
+        kfree(line->data);
+        kfree(line);
+        vlog.totlines--;
+    }
+	unlock_kernel();
+    return sz;
+}
+
+static unsigned int log_poll(struct file *file, poll_table * wait)
+{
+    struct vlog_st      *vlog = (struct vlog_st *) file->private_data;
+    unsigned int mask;
+
+    poll_wait(file, &readwait, wait);
+    mask = 0;
+    if (vlog->lines != NULL)
+        mask |= POLLIN | POLLRDNORM;
+    return mask;
+}
+
 
 /* Module Declarations */
 
@@ -427,9 +476,9 @@ struct file_operations vpp_fops = {
 struct file_operations vlog_fops = {
 	.owner   = THIS_MODULE,
 	.open    = log_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = seq_release
+	.read    = log_read,
+    .poll    = log_poll,
+	.release = log_release
 };
 
 static void vpp_attach(struct parport *port)
